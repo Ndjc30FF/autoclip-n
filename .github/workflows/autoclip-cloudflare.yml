@@ -1,0 +1,425 @@
+```yaml
+name: AutoClip - Cloudflare Web
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: autoclip-cloudflare-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  autoclip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3600
+
+    steps:
+      # ============================================================
+      # 1. CHECKOUT YOUR FORK
+      # ============================================================
+      - name: Checkout AutoClip
+        uses: actions/checkout@v4
+
+      # ============================================================
+      # 2. BASIC SYSTEM CHECK
+      # ============================================================
+      - name: Check environment
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          echo "============================================================"
+          echo "                 AUTOCLIP CLOUD DEPLOYMENT"
+          echo "============================================================"
+
+          echo "Runner:"
+          uname -a
+
+          echo
+          echo "Docker:"
+          docker --version
+
+          echo
+          echo "Docker Compose:"
+          docker compose version
+
+          echo
+          echo "Repository:"
+          pwd
+
+          echo
+          echo "Top-level files:"
+          ls -la
+
+      # ============================================================
+      # 3. PREPARE DIRECTORIES
+      # ============================================================
+      - name: Prepare AutoClip data directories
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          mkdir -p data
+          mkdir -p logs
+          mkdir -p uploads
+
+          chmod -R u+rwX data logs uploads
+
+          echo "Directories prepared:"
+          ls -ld data logs uploads
+
+      # ============================================================
+      # 4. CREATE ENVIRONMENT FILE
+      #
+      # Add API keys as GitHub Actions secrets if required.
+      # ============================================================
+      - name: Configure AutoClip environment
+        shell: bash
+        env:
+          LLM_PROVIDER: ${{ secrets.LLM_PROVIDER }}
+          API_MODEL_NAME: ${{ secrets.API_MODEL_NAME }}
+          API_DASHSCOPE_API_KEY: ${{ secrets.API_DASHSCOPE_API_KEY }}
+          API_OPENAI_API_KEY: ${{ secrets.API_OPENAI_API_KEY }}
+          OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
+          DASHSCOPE_BASE_URL: ${{ secrets.DASHSCOPE_BASE_URL }}
+          API_GEMINI_API_KEY: ${{ secrets.API_GEMINI_API_KEY }}
+          API_SILICONFLOW_API_KEY: ${{ secrets.API_SILICONFLOW_API_KEY }}
+        run: |
+          set -Eeuo pipefail
+
+          printf '%s\n' "LLM_PROVIDER=${LLM_PROVIDER:-dashscope}" > .env
+          printf '%s\n' "API_MODEL_NAME=${API_MODEL_NAME:-qwen-plus}" >> .env
+          printf '%s\n' "API_DASHSCOPE_API_KEY=${API_DASHSCOPE_API_KEY:-}" >> .env
+          printf '%s\n' "API_OPENAI_API_KEY=${API_OPENAI_API_KEY:-}" >> .env
+          printf '%s\n' "OPENAI_BASE_URL=${OPENAI_BASE_URL:-}" >> .env
+          printf '%s\n' "DASHSCOPE_BASE_URL=${DASHSCOPE_BASE_URL:-}" >> .env
+          printf '%s\n' "API_GEMINI_API_KEY=${API_GEMINI_API_KEY:-}" >> .env
+          printf '%s\n' "API_SILICONFLOW_API_KEY=${API_SILICONFLOW_API_KEY:-}" >> .env
+
+          echo "Environment configuration created."
+          echo "Secret values are NOT printed."
+
+      # ============================================================
+      # 5. VALIDATE COMPOSE BEFORE BUILDING
+      # ============================================================
+      - name: Validate Docker Compose
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          docker compose config --quiet
+
+          echo "Docker Compose configuration is valid."
+
+      # ============================================================
+      # 6. BUILD AUTOCLIP
+      # ============================================================
+      - name: Build AutoClip Docker images
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          echo "============================================================"
+          echo "                 BUILDING AUTOCLIP"
+          echo "============================================================"
+
+          docker compose build --pull
+
+      # ============================================================
+      # 7. START THE FULL STACK
+      # ============================================================
+      - name: Start AutoClip
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          echo "Starting AutoClip services..."
+
+          docker compose up -d
+
+          echo
+          echo "Initial container status:"
+          docker compose ps
+
+      # ============================================================
+      # 8. WAIT FOR API
+      # ============================================================
+      - name: Wait for AutoClip API
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          echo "Waiting for AutoClip API..."
+
+          READY=0
+
+          for attempt in $(seq 1 120); do
+            if curl -fsS --max-time 5 \
+              http://127.0.0.1:8000/api/v1/health/ >/tmp/autoclip-health.json 2>/dev/null; then
+
+              echo "AutoClip API is ready."
+              cat /tmp/autoclip-health.json
+              READY=1
+              break
+            fi
+
+            echo "Waiting for API... ${attempt}/120"
+            sleep 5
+          done
+
+          if [ "$READY" -ne 1 ]; then
+            echo
+            echo "ERROR: AutoClip API did not become ready."
+            echo
+            docker compose ps
+            echo
+            echo "--- AutoClip logs ---"
+            docker compose logs --tail=200 autoclip
+            echo
+            echo "--- Redis logs ---"
+            docker compose logs --tail=100 redis
+            exit 1
+          fi
+
+      # ============================================================
+      # 9. VERIFY WEB PORT
+      # ============================================================
+      - name: Verify AutoClip web interface
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          echo "Checking web interface on port 3000..."
+
+          WEB_READY=0
+
+          for attempt in $(seq 1 60); do
+            if curl -fsS --max-time 5 \
+              http://127.0.0.1:3000/ >/tmp/autoclip-web.html 2>/dev/null; then
+
+              echo "Web interface responded on port 3000."
+              head -c 500 /tmp/autoclip-web.html || true
+              echo
+              WEB_READY=1
+              break
+            fi
+
+            echo "Waiting for web interface... ${attempt}/60"
+            sleep 3
+          done
+
+          if [ "$WEB_READY" -ne 1 ]; then
+            echo
+            echo "ERROR: Port 3000 did not respond."
+            docker compose ps
+            echo
+            echo "--- AutoClip logs ---"
+            docker compose logs --tail=200 autoclip
+            exit 1
+          fi
+
+      # ============================================================
+      # 10. INSTALL CLOUDFLARED
+      # ============================================================
+      - name: Install cloudflared
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          curl -L \
+            --fail \
+            --retry 5 \
+            --retry-delay 2 \
+            -o cloudflared.deb \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+
+          sudo dpkg -i cloudflared.deb
+
+          cloudflared --version
+
+      # ============================================================
+      # 11. START CLOUDFLARE QUICK TUNNEL
+      #
+      # This creates a temporary public trycloudflare.com URL.
+      # No Cloudflare API token is required.
+      # ============================================================
+      - name: Start Cloudflare Tunnel
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          rm -f /tmp/cloudflared.log
+          rm -f /tmp/cloudflare-url.txt
+
+          echo "Starting Cloudflare Tunnel..."
+
+          nohup cloudflared tunnel \
+            --no-autoupdate \
+            --url http://127.0.0.1:3000 \
+            > /tmp/cloudflared.log 2>&1 &
+
+          CLOUDFLARED_PID=$!
+          echo "$CLOUDFLARED_PID" > /tmp/cloudflared.pid
+
+          echo "cloudflared PID: $CLOUDFLARED_PID"
+
+          TUNNEL_URL=""
+
+          for attempt in $(seq 1 60); do
+            sleep 2
+
+            if grep -Eo 'https://[-a-zA-Z0-9]+\.trycloudflare\.com' \
+              /tmp/cloudflared.log \
+              | head -n 1 > /tmp/cloudflare-url.txt; then
+
+              TUNNEL_URL="$(cat /tmp/cloudflare-url.txt)"
+
+              if [ -n "$TUNNEL_URL" ]; then
+                break
+              fi
+            fi
+
+            echo "Waiting for Cloudflare URL... ${attempt}/60"
+          done
+
+          if [ -z "$TUNNEL_URL" ]; then
+            echo
+            echo "ERROR: Cloudflare Tunnel URL was not created."
+            echo
+            cat /tmp/cloudflared.log || true
+            exit 1
+          fi
+
+          echo
+          echo "============================================================"
+          echo "                 AUTOCLIP IS ONLINE"
+          echo "============================================================"
+          echo
+          echo "PUBLIC URL:"
+          echo "$TUNNEL_URL"
+          echo
+          echo "API:"
+          echo "$TUNNEL_URL/docs"
+          echo
+          echo "============================================================"
+
+          echo "AUTCLIP_PUBLIC_URL=$TUNNEL_URL" >> "$GITHUB_ENV"
+
+      # ============================================================
+      # 12. VERIFY PUBLIC CLOUDFLARE URL
+      # ============================================================
+      - name: Verify Cloudflare public URL
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          echo "Waiting for public Cloudflare endpoint..."
+
+          PUBLIC_READY=0
+
+          for attempt in $(seq 1 30); do
+            if curl -fsS \
+              --max-time 15 \
+              "$AUTCLIP_PUBLIC_URL/" \
+              >/tmp/public-autoclip.html 2>/dev/null; then
+
+              echo
+              echo "Cloudflare public endpoint is responding."
+              echo "URL: $AUTCLIP_PUBLIC_URL"
+              echo
+
+              PUBLIC_READY=1
+              break
+            fi
+
+            echo "Public endpoint not ready... ${attempt}/30"
+            sleep 4
+          done
+
+          if [ "$PUBLIC_READY" -ne 1 ]; then
+            echo
+            echo "ERROR: Cloudflare public endpoint could not be verified."
+            echo
+            echo "--- cloudflared logs ---"
+            cat /tmp/cloudflared.log || true
+            exit 1
+          fi
+
+      # ============================================================
+      # 13. KEEP RUNNER ALIVE
+      # ============================================================
+      - name: Keep AutoClip online
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          echo
+          echo "============================================================"
+          echo "              AUTOCLIP CLOUD SERVICE ACTIVE"
+          echo "============================================================"
+          echo
+          echo "Public URL:"
+          echo "$AUTCLIP_PUBLIC_URL"
+          echo
+          echo "API documentation:"
+          echo "$AUTCLIP_PUBLIC_URL/docs"
+          echo
+          echo "The GitHub Actions runner must remain active."
+          echo "Stopping this workflow will stop AutoClip and Cloudflare Tunnel."
+          echo
+          echo "============================================================"
+
+          while true; do
+            if ! kill -0 "$(cat /tmp/cloudflared.pid)" 2>/dev/null; then
+              echo "ERROR: cloudflared stopped."
+              echo
+              cat /tmp/cloudflared.log || true
+              exit 1
+            fi
+
+            if ! curl -fsS --max-time 10 \
+              http://127.0.0.1:8000/api/v1/health/ \
+              >/dev/null 2>&1; then
+              echo "WARNING: AutoClip API health check failed."
+              docker compose ps
+            fi
+
+            sleep 60
+          done
+
+      # ============================================================
+      # 14. ALWAYS SHOW DIAGNOSTICS
+      # ============================================================
+      - name: Collect diagnostics
+        if: always()
+        shell: bash
+        run: |
+          set +e
+
+          echo
+          echo "============================================================"
+          echo "                 AUTOCLIP FAILURE DIAGNOSTICS"
+          echo "============================================================"
+
+          docker compose ps
+
+          echo
+          echo "--- AutoClip logs ---"
+          docker compose logs --tail=300 autoclip
+
+          echo
+          echo "--- Celery worker logs ---"
+          docker compose logs --tail=200 celery-worker
+
+          echo
+          echo "--- Celery beat logs ---"
+          docker compose logs --tail=100 celery-beat
+
+          echo
+          echo "--- Redis logs ---"
+          docker compose logs --tail=100 redis
+
+          echo
+          echo "--- Cloudflare Tunnel logs ---"
+          cat /tmp/cloudflared.log 2>/dev/null || true
+```
