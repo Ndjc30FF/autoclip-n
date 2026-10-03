@@ -1,4 +1,3 @@
-```yaml
 name: AutoClip - Cloudflare Web
 
 on:
@@ -422,4 +421,3 @@ jobs:
           echo
           echo "--- Cloudflare Tunnel logs ---"
           cat /tmp/cloudflared.log 2>/dev/null || true
-```
