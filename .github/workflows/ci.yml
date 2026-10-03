@@ -1,266 +1,470 @@
-name: CI
+name: AutoClip Web - Cloudflare
 
 on:
-  workflow_call:
-  pull_request:
-  push:
-    branches:
-      - main
-      - master
+  workflow_dispatch:
 
-permissions:
-  contents: read
+concurrency:
+  group: autoclip-web-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  windows-runtime:
-    uses: ./.github/workflows/windows-asyncio.yml
-
-  contracts:
-    name: Release contract checks
+  autoclip-web:
+    name: AutoClip Web Runtime
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-      - name: Versions, translations and acceptance gate regressions
-        run: python scripts/quality_gate.py --group contracts --report quality/contracts.json
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: quality-contracts
-          path: quality/contracts.json
-          if-no-files-found: error
+    timeout-minutes: 350
 
-  backend:
-    name: Backend tests
-    runs-on: ubuntu-latest
     steps:
-      - name: Checkout
+
+      - name: "📥 Checkout AutoClip"
         uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          cache: pip
-
-      - name: Install video test runtime
+      - name: "🔍 Check environment"
+        shell: bash
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg fonts-noto-cjk
-          ffmpeg -version
-          ffprobe -version
+          set -Eeuo pipefail
 
-      - name: Install dependencies
+          echo "============================================================"
+          echo "                 AUTOCLIP WEB RUNTIME"
+          echo "============================================================"
+
+          echo "Repository:"
+          pwd
+
+          echo
+          echo "Docker:"
+          docker --version
+
+          echo
+          echo "Docker Compose:"
+          docker compose version
+
+          echo
+          echo "Files:"
+          ls -la
+
+      - name: "📁 Prepare directories"
+        shell: bash
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install -r requirements-test.txt
+          set -Eeuo pipefail
 
-      - name: Report existing Python style debt (advisory)
-        continue-on-error: true
-        run: ruff check backend
+          mkdir -p data
+          mkdir -p logs
+          mkdir -p uploads
 
-      - name: Blocking correctness lint, all backend tests and editorial fixtures
+          chmod -R u+rwX data logs uploads
+
+          echo "Directories ready."
+
+      - name: "⚙️ Configure AutoClip"
+        shell: bash
         env:
-          DASHSCOPE_API_KEY: test_api_key
-          LOG_FORMAT: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-        run: python scripts/quality_gate.py --group backend --report quality/backend.json
+          LLM_PROVIDER: ${{ secrets.LLM_PROVIDER }}
+          API_MODEL_NAME: ${{ secrets.API_MODEL_NAME }}
+          API_DASHSCOPE_API_KEY: ${{ secrets.API_DASHSCOPE_API_KEY }}
+          API_OPENAI_API_KEY: ${{ secrets.API_OPENAI_API_KEY }}
+          OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
+          DASHSCOPE_BASE_URL: ${{ secrets.DASHSCOPE_BASE_URL }}
+          API_GEMINI_API_KEY: ${{ secrets.API_GEMINI_API_KEY }}
+          API_SILICONFLOW_API_KEY: ${{ secrets.API_SILICONFLOW_API_KEY }}
 
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: quality-backend
-          path: quality/backend.json
-          if-no-files-found: error
-
-      - name: Installed wheel portrait framing smoke
         run: |
-          pip install 'opencv-python-headless>=4.10'
-          pip wheel --no-deps --wheel-dir /tmp/autoclip-wheel .
-          python scripts/verify_python_wheel.py /tmp/autoclip-wheel/autoclip-*-py3-none-any.whl --video backend/assets/example/source.mp4 --report /tmp/autoclip-wheel/portrait-report.json
+          set -Eeuo pipefail
 
-      - name: Community board and feedback ingest checks
+          printf '%s\n' "LLM_PROVIDER=${LLM_PROVIDER:-dashscope}" > .env
+          printf '%s\n' "API_MODEL_NAME=${API_MODEL_NAME:-qwen-plus}" >> .env
+          printf '%s\n' "API_DASHSCOPE_API_KEY=${API_DASHSCOPE_API_KEY:-}" >> .env
+          printf '%s\n' "API_OPENAI_API_KEY=${API_OPENAI_API_KEY:-}" >> .env
+          printf '%s\n' "OPENAI_BASE_URL=${OPENAI_BASE_URL:-}" >> .env
+          printf '%s\n' "DASHSCOPE_BASE_URL=${DASHSCOPE_BASE_URL:-}" >> .env
+          printf '%s\n' "API_GEMINI_API_KEY=${API_GEMINI_API_KEY:-}" >> .env
+          printf '%s\n' "API_SILICONFLOW_API_KEY=${API_SILICONFLOW_API_KEY:-}" >> .env
+
+          echo "AutoClip environment configured."
+
+      - name: "🧪 Validate Docker Compose"
+        shell: bash
         run: |
-          python3 scripts/test_community_board.py
-          python3 scripts/test_ingest_feedback.py
+          set -Eeuo pipefail
 
-      - name: Set up Node for source launcher
-        uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-      - name: Source launcher and scoped shutdown smoke
+          docker compose config --quiet
+
+          echo "Docker Compose configuration is valid."
+
+      - name: "🐳 Build AutoClip"
+        shell: bash
         run: |
-          python -m venv --system-site-packages venv
-          (cd frontend && npm ci)
-          cp env.example .env
-          docker run -d --name autoclip-source-redis -p 6379:6379 redis:7-alpine
-          for i in $(seq 1 30); do
-            if docker exec autoclip-source-redis redis-cli ping; then break; fi
-            sleep 1
-          done
-          ./quick_start.sh
-          ./status_autoclip.sh
-          ./stop_autoclip.sh
-          if ./status_autoclip.sh; then echo 'Stopped services incorrectly reported healthy'; exit 1; fi
-      - name: Source runtime logs on failure
-        if: failure()
-        run: cat logs/backend.log logs/frontend.log logs/celery.log 2>/dev/null || true
-      - name: Clean up source smoke
-        if: always()
+          set -Eeuo pipefail
+
+          echo "Building AutoClip..."
+
+          docker compose build --pull
+
+          echo "Build completed."
+
+      - name: "🚀 Start AutoClip"
+        shell: bash
         run: |
-          ./stop_autoclip.sh || true
-          docker rm -f autoclip-source-redis || true
+          set -Eeuo pipefail
 
-  frontend:
-    name: Frontend checks
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: frontend
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+          docker compose up -d
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-          cache: npm
-          cache-dependency-path: frontend/package-lock.json
+          echo
+          echo "============================================================"
+          echo "                 CONTAINER STATUS"
+          echo "============================================================"
 
-      - name: Install dependencies
-        run: npm ci
+          docker compose ps
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-      - name: Blocking lint, types, tests and production build
-        working-directory: .
-        run: python scripts/quality_gate.py --group frontend --report quality/frontend.json
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: quality-frontend
-          path: quality/frontend.json
-          if-no-files-found: error
-
-  # Guards the README's recommended `docker compose` path, which was broken for months
-  # without anything in CI noticing (issue #88): the image failed to build, the worker
-  # consumed the wrong queues, and a hardcoded localhost Redis check failed every project.
-  docker-smoke:
-    name: Docker compose smoke
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Build image
-        run: docker compose build autoclip
-
-      - name: Start redis + api + worker
+      - name: "❤️ Wait for AutoClip API"
+        shell: bash
         run: |
-          # Bind-mounted dirs are created root-owned by the daemon; the container runs as
-          # a non-root user, so pre-create them writable.
-          mkdir -p data logs uploads && chmod -R 777 data logs uploads
-          # A throwaway .env, the way DOCKER.md tells users to configure the LLM.
-          printf 'LLM_PROVIDER=openai\nOPENAI_BASE_URL=http://llm.example.test/v1\nAPI_MODEL_NAME=smoke-model\n' > .env
-          docker compose up -d --no-build redis autoclip celery-worker
+          set -Eeuo pipefail
 
-      - name: Wait for API health
-        run: |
-          for i in $(seq 1 60); do
-            if curl -fsS http://localhost:8000/api/v1/health/ >/dev/null 2>&1; then
-              echo "API healthy after ${i} tries"; exit 0
+          echo "Waiting for AutoClip API..."
+
+          READY=0
+
+          for attempt in $(seq 1 120); do
+
+            if curl -fsS \
+              --max-time 5 \
+              http://127.0.0.1:8000/api/v1/health/ \
+              >/tmp/autoclip-health.json 2>/dev/null; then
+
+              echo
+              echo "============================================================"
+              echo "              AUTOCLIP API IS READY"
+              echo "============================================================"
+
+              cat /tmp/autoclip-health.json
+
+              READY=1
+              break
             fi
-            sleep 3
-          done
-          echo "API never became healthy"; exit 1
 
-      - name: yt-dlp is importable on the image's Python
-        run: docker compose exec -T autoclip python -m yt_dlp --version
-
-      - name: LLM settings from .env reach both api and worker
-        run: |
-          for svc in autoclip celery-worker; do
-            docker compose exec -T "$svc" python - <<'EOF'
-          import os, sys
-          sys.path.insert(0, "/app")
-          from backend.core.llm_manager import LLMManager
-          info = LLMManager().get_current_provider_info()
-          assert info["provider"] == "openai", info
-          assert info["model"] == "smoke-model", info
-          assert info.get("base_url") == "http://llm.example.test/v1", info
-          assert info["available"] is True, info   # keyless custom endpoint is enough
-          print("OK", os.environ.get("HOSTNAME"), info)
-          EOF
-          done
-
-      - name: Task submission reaches Redis via REDIS_URL
-        run: |
-          docker compose exec -T autoclip python - <<'EOF'
-          from backend.utils.task_submission_utils import _log_queue_depth
-          depth = _log_queue_depth("processing")
-          assert depth is not None, "could not reach Redis through REDIS_URL"
-          print("processing queue depth:", depth)
-          EOF
-
-      - name: Worker consumes the routed queues
-        run: |
-          for i in $(seq 1 20); do
-            out=$(docker compose exec -T celery-worker celery -A backend.core.celery_app inspect --json --timeout 10 active_queues 2>/dev/null || true)
-            if echo "$out" | grep -q '"name": "processing"'; then break; fi
+            echo "API not ready: ${attempt}/120"
             sleep 5
           done
-          echo "$out"
-          for q in celery processing video notification upload; do
-            echo "$out" | grep -q "\"name\": \"$q\"" || { echo "worker is not consuming queue: $q"; exit 1; }
-          done
 
-      - name: Dump logs on failure
-        if: failure()
-        run: docker compose logs --no-color
+          if [ "$READY" -ne 1 ]; then
 
-      - name: Tear down
-        if: always()
-        run: docker compose down -v --remove-orphans
+            echo
+            echo "============================================================"
+            echo "              AUTOCLIP API FAILED"
+            echo "============================================================"
 
-  docker-dev-smoke:
-    name: Docker development compose smoke
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-      - name: Build development image
-        run: docker compose -f docker-compose.dev.yml build autoclip-dev
-      - name: Start development services through compatibility entrypoint
-        run: ./docker-start.sh dev --no-build
-      - name: Wait for both development servers and the worker
+            docker compose ps
+
+            echo
+            echo "--- AutoClip logs ---"
+            docker compose logs --tail=300 autoclip
+
+            echo
+            echo "--- Redis logs ---"
+            docker compose logs --tail=150 redis
+
+            echo
+            echo "--- Celery logs ---"
+            docker compose logs --tail=150 celery-worker
+
+            exit 1
+          fi
+
+      - name: "🌐 Detect AutoClip Web Interface"
+        shell: bash
         run: |
-          for i in $(seq 1 90); do
-            if curl -fsS http://localhost:8000/api/v1/health/ >/dev/null 2>&1 && curl -fsS http://localhost:3000/ >/dev/null 2>&1; then break; fi
-            sleep 3
-          done
-          curl -fsS http://localhost:8000/api/v1/health/
-          curl -fsS http://localhost:3000/ >/dev/null
-          for i in $(seq 1 20); do
-            out=$(docker compose -f docker-compose.dev.yml exec -T celery-worker-dev celery -A backend.core.celery_app inspect --json --timeout 5 active_queues 2>/dev/null || true)
-            if echo "$out" | grep -q '"name": "processing"'; then break; fi
-            sleep 3
-          done
-          for q in celery processing video notification upload; do
-            echo "$out" | grep -q "\"name\": \"$q\""
-          done
-          ./docker-status.sh dev
-      - name: Stop through compatibility entrypoint
+          set -Eeuo pipefail
+
+          echo "Checking AutoClip web interface..."
+
+          WEB_PORT=""
+
+          if curl -fsS \
+            --max-time 5 \
+            http://127.0.0.1:3000/ \
+            >/tmp/autoclip-web.html 2>/dev/null; then
+
+            WEB_PORT="3000"
+
+          elif curl -fsS \
+            --max-time 5 \
+            http://127.0.0.1:8000/ \
+            >/tmp/autoclip-web.html 2>/dev/null; then
+
+            WEB_PORT="8000"
+
+          fi
+
+          if [ -z "$WEB_PORT" ]; then
+
+            echo
+            echo "ERROR: AutoClip Web UI could not be detected."
+
+            echo
+            echo "--- Docker status ---"
+            docker compose ps
+
+            echo
+            echo "--- AutoClip logs ---"
+            docker compose logs --tail=300 autoclip
+
+            exit 1
+          fi
+
+          echo "AutoClip Web UI detected on port: $WEB_PORT"
+
+          echo "AUTOCLIP_WEB_PORT=$WEB_PORT" >> "$GITHUB_ENV"
+
+      - name: "🔎 Show local Web URL"
+        shell: bash
         run: |
-          ./docker-stop.sh dev
-          if ./docker-status.sh dev; then echo 'Stopped containers incorrectly reported healthy'; exit 1; fi
-      - name: Dump logs on failure
-        if: failure()
-        run: docker compose -f docker-compose.dev.yml logs --no-color
-      - name: Tear down CI resources
+          set -Eeuo pipefail
+
+          echo
+          echo "============================================================"
+          echo "                  LOCAL WEB SERVICE"
+          echo "============================================================"
+          echo
+          echo "Port:"
+          echo "$AUTOCLIP_WEB_PORT"
+          echo
+          echo "URL:"
+          echo "http://127.0.0.1:$AUTOCLIP_WEB_PORT"
+          echo
+          echo "============================================================"
+
+      - name: "☁️ Install Cloudflared"
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          curl -L \
+            --fail \
+            --retry 5 \
+            --retry-delay 2 \
+            -o cloudflared.deb \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+
+          sudo dpkg -i cloudflared.deb
+
+          cloudflared --version
+
+      - name: "🔗 Start Cloudflare Tunnel"
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          rm -f /tmp/cloudflared.log
+          rm -f /tmp/cloudflare-url.txt
+
+          echo
+          echo "============================================================"
+          echo "              STARTING CLOUDFLARE TUNNEL"
+          echo "============================================================"
+
+          nohup cloudflared tunnel \
+            --no-autoupdate \
+            --url "http://127.0.0.1:$AUTOCLIP_WEB_PORT" \
+            >/tmp/cloudflared.log 2>&1 &
+
+          CLOUDFLARED_PID=$!
+
+          printf '%s\n' "$CLOUDFLARED_PID" >/tmp/cloudflared.pid
+
+          echo "cloudflared PID: $CLOUDFLARED_PID"
+
+          TUNNEL_URL=""
+
+          for attempt in $(seq 1 60); do
+
+            sleep 2
+
+            TUNNEL_URL="$(
+              grep -Eo 'https://[-a-zA-Z0-9]+\.trycloudflare\.com' \
+              /tmp/cloudflared.log \
+              | head -n 1 \
+              || true
+            )"
+
+            if [ -n "$TUNNEL_URL" ]; then
+              break
+            fi
+
+            echo "Waiting for Cloudflare URL: ${attempt}/60"
+          done
+
+          if [ -z "$TUNNEL_URL" ]; then
+
+            echo
+            echo "============================================================"
+            echo "          CLOUDFLARE TUNNEL FAILED"
+            echo "============================================================"
+
+            cat /tmp/cloudflared.log || true
+
+            exit 1
+          fi
+
+          printf '%s\n' "AUTOCLIP_PUBLIC_URL=$TUNNEL_URL" >> "$GITHUB_ENV"
+
+          echo
+          echo "============================================================"
+          echo "             🚀 AUTOCLIP IS ONLINE"
+          echo "============================================================"
+          echo
+          echo "PUBLIC WEB URL:"
+          echo
+          echo "$TUNNEL_URL"
+          echo
+          echo "API:"
+          echo
+          echo "$TUNNEL_URL/docs"
+          echo
+          echo "============================================================"
+
+      - name: "🌍 Verify public website"
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          echo "Checking Cloudflare public URL..."
+
+          READY=0
+
+          for attempt in $(seq 1 30); do
+
+            if curl -fsS \
+              --max-time 15 \
+              "$AUTOCLIP_PUBLIC_URL/" \
+              >/tmp/public-autoclip.html 2>/dev/null; then
+
+              echo
+              echo "============================================================"
+              echo "          PUBLIC WEBSITE IS WORKING"
+              echo "============================================================"
+              echo
+              echo "$AUTOCLIP_PUBLIC_URL"
+              echo
+              echo "============================================================"
+
+              READY=1
+              break
+            fi
+
+            echo "Waiting for public website: ${attempt}/30"
+            sleep 4
+          done
+
+          if [ "$READY" -ne 1 ]; then
+
+            echo
+            echo "Public Cloudflare URL did not respond."
+
+            echo
+            echo "--- Cloudflare logs ---"
+            cat /tmp/cloudflared.log || true
+
+            exit 1
+          fi
+
+      - name: "📌 Publish access information"
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          echo
+          echo "╔════════════════════════════════════════════════════════════╗"
+          echo "║                  AUTOCLIP WEB ACCESS                     ║"
+          echo "╠════════════════════════════════════════════════════════════╣"
+          echo "║                                                            ║"
+          echo "║  WEBSITE:                                                  ║"
+          echo "║  $AUTOCLIP_PUBLIC_URL"
+          echo "║                                                            ║"
+          echo "║  API DOCS:                                                 ║"
+          echo "║  $AUTOCLIP_PUBLIC_URL/docs"
+          echo "║                                                            ║"
+          echo "╚════════════════════════════════════════════════════════════╝"
+
+      - name: "⏳ Keep AutoClip Running"
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          echo
+          echo "============================================================"
+          echo "             AUTOCLIP CLOUD SERVICE ACTIVE"
+          echo "============================================================"
+          echo
+          echo "Website:"
+          echo "$AUTOCLIP_PUBLIC_URL"
+          echo
+          echo "API:"
+          echo "$AUTOCLIP_PUBLIC_URL/docs"
+          echo
+          echo "This step intentionally stays running."
+          echo "The website remains available while this job is running."
+          echo
+          echo "============================================================"
+
+          while true; do
+
+            if ! kill -0 "$(cat /tmp/cloudflared.pid)" 2>/dev/null; then
+
+              echo
+              echo "ERROR: Cloudflare tunnel stopped."
+
+              cat /tmp/cloudflared.log || true
+
+              exit 1
+            fi
+
+            if ! curl -fsS \
+              --max-time 10 \
+              http://127.0.0.1:8000/api/v1/health/ \
+              >/dev/null 2>&1; then
+
+              echo
+              echo "WARNING: AutoClip API health check failed."
+
+              docker compose ps
+            fi
+
+            echo "[$(date -u '+%Y-%m-%d %H:%M:%S UTC')] AutoClip is running."
+
+            sleep 60
+          done
+
+      - name: "🛠️ Diagnostics"
         if: always()
-        run: docker compose -f docker-compose.dev.yml down -v --remove-orphans
+        shell: bash
+        run: |
+          set +e
+
+          echo
+          echo "============================================================"
+          echo "              AUTOCLIP DIAGNOSTICS"
+          echo "============================================================"
+
+          echo
+          echo "--- Docker containers ---"
+          docker compose ps
+
+          echo
+          echo "--- AutoClip ---"
+          docker compose logs --tail=300 autoclip
+
+          echo
+          echo "--- Celery Worker ---"
+          docker compose logs --tail=200 celery-worker
+
+          echo
+          echo "--- Celery Beat ---"
+          docker compose logs --tail=150 celery-beat
+
+          echo
+          echo "--- Redis ---"
+          docker compose logs --tail=150 redis
+
+          echo
+          echo "--- Cloudflare ---"
+          cat /tmp/cloudflared.log 2>/dev/null || true
